@@ -9,14 +9,14 @@ import Patient from "./models/Patient.js";
 import Entity from "./models/Entity.js";
 import { accessContract, registryContract, tokenContract, ethers, provider } from "./blockchain.js";
 
-console.log("\ud83d\udce1 Attempting to connect to MongoDB...");
+console.log("📡 Attempting to connect to MongoDB...");
 if (!process.env.DATABASE_URL) {
-    console.error("\u274c CRITICAL: DATABASE_URL is missing in .env");
+    console.error("❌ CRITICAL: DATABASE_URL is missing in .env");
 }
 
 mongoose.connect(process.env.DATABASE_URL)
     .then(async () => {
-        console.log("\ud83c\udf43 MongoDB Atlas connected successfully");
+        console.log("🍃 MongoDB Atlas connected successfully");
         if (process.env.WIPE_DB_ON_START === "true") {
             const collections = await mongoose.connection.db.collections();
             for (let collection of collections) {
@@ -25,7 +25,7 @@ mongoose.connect(process.env.DATABASE_URL)
         }
     })
     .catch(err => {
-        console.error("\u274c MongoDB connection error:", err.message);
+        console.error("❌ MongoDB connection error:", err.message);
         process.exit(1); 
     });
 
@@ -118,4 +118,4 @@ app.get("/api/accounts/available", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`\ud83d\ude80 Hub running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Hub running on port ${PORT}`));

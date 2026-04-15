@@ -1,0 +1,430 @@
+const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+dotenv.config();
+const multer = require("multer");
+const mongoose = require("mongoose");
+const Prescription = require("./models/Prescription");
+const { accessContract, registryContract, tokenContract, ethers } = require("./blockchain");
+
+// Connect to MongoDB Atlas
+console.log("📡 Attempting to connect to MongoDB...");
+if (!process.env.DATABASE_URL) {
+    console.error("❌ CRITICAL: DATABASE_URL is missing in .env");
+}
+
+mongoose.connect(process.env.DATABASE_URL)
+    .then(() => {
+        console.log("🍃 MongoDB Atlas connected successfully");
+        console.log(`📡 Cluster: ${process.env.DATABASE_URL.split('@')[1].split('/')[0]}`);
+    })
+    .catch(err => {
+        console.error("❌ MongoDB connection error:", err.message);
+        process.exit(1); // Exit if DB fails to ensure we don't run in broken state
+    });
+
+const app = express();
+
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, 'uploads/')
+    },
+    filename: function (req, file, cb) {
+        cb(null, Date.now() + '-' + file.originalname)
+    }
+});
+const upload = multer({ storage: storage });
+
+app.use(cors());
+app.use(express.json());
+
+/* -------------------------------------------------------------------------- */
+/*                                POST ENDPOINTS                              */
+/* -------------------------------------------------------------------------- */
+
+app.post("/api/prescription", upload.single('prescriptionPdf'), async (req, res) => {
+    console.log("\n--- 🆕 New Prescription Request ---");
+    try {
+        const { patientName, fatherName, address, drugId, totalQty, expiry } = req.body;
+        console.log(`📝 Patient: ${patientName}, Father: ${fatherName}`);
+        
+        // Generate Slip Hash locally (Ensures it's never missing!)
+        const slipHash = ethers.hexlify(ethers.randomBytes(32));
+        console.log(`🔑 Generated slipHash: ${slipHash}`);
+        
+        // Identity Hash for blockchain (off-chain matching)
+        const identityString = `${patientName.trim().toLowerCase()}-${fatherName.trim().toLowerCase()}-${address.trim().toLowerCase()}`;
+        const patientHash = ethers.keccak256(ethers.toUtf8Bytes(identityString));
+
+        const expiryVal = parseInt(expiry) || Math.floor(Date.now() / 1000) + 86400 * 365;
+
+        // 1. Save to MongoDB first
+        const dbPrescription = new Prescription({
+            slipHash,
+            patientName,
+            fatherName,
+            address,
+            drugId: parseInt(drugId),
+            totalQty: parseInt(totalQty),
+            expiry: expiryVal
+        });
+        
+        console.log("⏳ Saving metadata to MongoDB...");
+        await dbPrescription.save();
+        console.log(`✅ MongoDB record created successfully`);
+
+        // 2. Submit to Blockchain
+        console.log("⏳ Submitting to Blockchain...");
+        const tx = await registryContract.issuePrescription(
+            patientHash,
+            parseInt(drugId),
+            parseInt(totalQty),
+            expiryVal,
+            slipHash
+        );
+        console.log(`⛓️ Blockchain Tx Sent: ${tx.hash}`);
+        
+        const receipt = await tx.wait();
+        console.log(`⛓️ Blockchain Transaction Confirmed in block ${receipt.blockNumber}`);
+        
+        // 3. Update DB with TX Hash
+        dbPrescription.txHash = tx.hash;
+        await dbPrescription.save();
+        console.log(`💾 Finalized DB record with TX hash`);
+
+        const responseData = { 
+            status: "success", 
+            txHash: tx.hash, 
+            slipHash,
+            metadata: dbPrescription 
+        };
+        console.log("🚀 Sending success response to frontend");
+        res.json(responseData);
+    } catch (e) {
+        console.error("❌ POST /api/prescription Error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.post("/api/supply", async (req, res) => {
+    try {
+        const { storeAddress, drugId, quantity } = req.body;
+        const tx = await tokenContract.recordSupply(
+            storeAddress,
+            parseInt(drugId),
+            parseInt(quantity)
+        );
+        await tx.wait();
+        res.json({ status: "success", txHash: tx.hash });
+    } catch (e) {
+        console.error("POST /api/supply error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.post("/api/sell", async (req, res) => {
+    try {
+        const { slipHash, patientName, quantity } = req.body;
+        const patientHash = ethers.keccak256(ethers.toUtf8Bytes(patientName));
+
+        const tx = await tokenContract.sellWithSlip(
+            slipHash,
+            patientHash,
+            parseInt(quantity)
+        );
+        await tx.wait();
+
+        res.json({ status: "success", txHash: tx.hash });
+    } catch (e) {
+        console.error("POST /api/sell error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.post("/api/entities/:type", async (req, res) => {
+    try {
+        const { type } = req.params;
+        const { address, name } = req.body;
+        
+        if(!address || !name) {
+            return res.status(400).json({ error: "Address and Name are required" });
+        }
+
+        let tx;
+        if (type === "hospital") {
+            tx = await accessContract.addHospital(address, name);
+        } else if (type === "dealer") {
+            tx = await accessContract.addDealer(address, name);
+        } else if (type === "medical-store") {
+            tx = await accessContract.addMedicalStore(address, name);
+        } else if (type === "regulator") {
+            tx = await accessContract.addRegulator(address, name);
+        } else {
+            return res.status(400).json({ error: "Invalid entity type" });
+        }
+
+        await tx.wait();
+        res.json({ status: "success", txHash: tx.hash, message: `${type} registered successfully` });
+    } catch (e) {
+        console.error("POST /api/entities error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                                 GET ENDPOINTS                              */
+/* -------------------------------------------------------------------------- */
+
+app.get("/api/prescriptions", async (req, res) => {
+    try {
+        const filter = registryContract.filters.PrescriptionIssued();
+        const logs = await registryContract.queryFilter(filter, 0, "latest");
+        
+        const results = [];
+        for (const log of logs) {
+            const prescId = log.args[0];
+            const slipHash = log.args[1];
+            const drugId = log.args[2];
+            const totalQty = log.args[3];
+            const expiry = log.args[4];
+            const patientHash = log.args[5];
+            
+            const prescState = await registryContract.prescriptions(prescId);
+            const remainingQty = prescState[5]; // remainingQty is at index 5 in struct Prescription
+            const hospital = prescState[7]; // hospital at index 7
+            const active = prescState[8]; // active at index 8
+            
+            results.push({
+                prescriptionId: prescId,
+                slipHash,
+                patientHash,
+                drugId: Number(drugId),
+                totalQty: Number(totalQty),
+                remainingQty: Number(remainingQty),
+                expiry: Number(expiry),
+                hospital,
+                active,
+                transactionHash: log.transactionHash
+            });
+        }
+        res.json(results);
+    } catch (e) {
+        console.error("GET /api/prescriptions error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.get("/api/prescription/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const prescState = await registryContract.prescriptions(id);
+        res.json({
+            prescriptionId: id,
+            slipHash: prescState[1],
+            patientHash: prescState[2],
+            drugId: Number(prescState[3]),
+            totalQty: Number(prescState[4]),
+            remainingQty: Number(prescState[5]),
+            expiry: Number(prescState[6]),
+            hospital: prescState[7],
+            active: prescState[8],
+            issuedAt: Number(prescState[9])
+        });
+    } catch (e) {
+        console.error("GET /api/prescription/:id error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+// New endpoint to verify slipHash
+app.get("/api/prescription/slip/:slipHash", async (req, res) => {
+    try {
+        const { slipHash } = req.params;
+        const data = await registryContract.verifyBySlip(slipHash);
+        res.json({
+            valid: data[0],
+            active: data[0], // map valid to active for frontend compatibility
+            prescriptionId: data[1],
+            drugId: Number(data[2]),
+            remainingQty: Number(data[3])
+        });
+    } catch (e) {
+        console.error("GET /api/prescription/slip/:slipHash error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+// New endpoint to fetch patient metadata from MongoDB for reprinting
+app.get("/api/prescription/metadata/:slipHash", async (req, res) => {
+    try {
+        const { slipHash } = req.params;
+        console.log(`🔍 [METADATA] Incoming request for slipHash: "${slipHash}"`);
+        
+        if (!slipHash || slipHash === "undefined") {
+            console.log("⚠️ [METADATA] Received invalid or undefined slipHash.");
+            return res.status(400).json({ error: "Invalid slipHash provided." });
+        }
+
+        let meta = await Prescription.findOne({ slipHash });
+        
+        if (!meta) {
+            console.log(`🔍 [METADATA] Not found in MongoDB. Checking Blockchain for ${slipHash}...`);
+            try {
+                // Try to find the prescriptionID from the ledger
+                const v = await registryContract.verifyBySlip(slipHash);
+                const prescId = v[1];
+
+                if (prescId && prescId !== ethers.ZeroHash) {
+                    const p = await registryContract.prescriptions(prescId);
+                    // Reconstruct partial metadata from blockchain
+                    meta = {
+                        patientName: "Legacy Patient (Recovered)",
+                        fatherName: "N/A",
+                        address: "System Recovery",
+                        drugId: Number(p[3]),
+                        totalQty: Number(p[4]),
+                        expiry: Number(p[6]),
+                        slipHash: p[1] || slipHash,
+                        isRecovered: true
+                    };
+                    console.log(`✅ [DEBUG] Reconstructed from blockchain: ${prescId}`);
+                }
+            } catch (err) {
+                console.error("🔴 [DEBUG] Blockchain reconstruction failed:", err.message);
+            }
+        }
+
+        if (!meta) {
+            console.log(`❌ [DEBUG] All search methods failed for: ${slipHash}`);
+            return res.status(404).json({ error: "Prescription metadata not found. This record was likely lost during the recent database migration." });
+        }
+        
+        console.log(`✅ [DEBUG] Found metadata for: ${meta.patientName}`);
+        res.json(meta);
+    } catch (e) {
+        console.error("🔴 [DEBUG] GET /api/prescription/metadata/:slipHash error:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get("/api/stores", async (req, res) => {
+    try {
+        const MEDICAL_STORE_ROLE = ethers.keccak256(ethers.toUtf8Bytes("MEDICAL_STORE"));
+        const filter = accessContract.filters.EntityRegistered(null, MEDICAL_STORE_ROLE);
+        const logs = await accessContract.queryFilter(filter, 0, "latest");
+        
+        const stores = logs.map(log => ({
+            address: log.args[0],
+            name: log.args[2]
+        }));
+        
+        // Add hardcoded demo stores if empty for fallback (optional, but let's be dynamic)
+        if (stores.length === 0) {
+            return res.json([
+                { address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", name: "CarePlus Pharmacy (Demo)" },
+                { address: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8", name: "Metro Health Store" }
+            ]);
+        }
+        
+        res.json(stores);
+    } catch (e) {
+        console.error("GET /api/stores error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.get("/api/supply/history", async (req, res) => {
+    try {
+        const store = req.query.store || null;
+        const dealer = req.query.dealer || null;
+        const filter = tokenContract.filters.SupplyRecorded(dealer, store);
+        const logs = await tokenContract.queryFilter(filter, 0, "latest");
+        
+        const results = logs.map(log => {
+            return {
+                dealer: log.args[0],
+                store: log.args[1],
+                drugId: Number(log.args[2]),
+                quantity: Number(log.args[3]),
+                timestamp: Number(log.args[4]),
+                transactionHash: log.transactionHash
+            };
+        });
+        res.json(results);
+    } catch (e) {
+        console.error("GET /api/supply/history error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.get("/api/sales", async (req, res) => {
+    try {
+        const store = req.query.store || null;
+        const prescId = req.query.prescriptionId || null;
+        const filter = tokenContract.filters.SaleRecorded(prescId, store);
+        const logs = await tokenContract.queryFilter(filter, 0, "latest");
+        
+        const results = logs.map(log => {
+            return {
+                prescriptionId: log.args[0],
+                store: log.args[1],
+                drugId: Number(log.args[2]),
+                quantity: Number(log.args[3]),
+                patientHash: log.args[4],
+                timestamp: Number(log.args[5]),
+                transactionHash: log.transactionHash
+            };
+        });
+        res.json(results);
+    } catch (e) {
+        console.error("GET /api/sales error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.get("/api/inventory/:store/:drugId", async (req, res) => {
+    try {
+        const { store, drugId } = req.params;
+        const qty = await tokenContract.inventory(store, parseInt(drugId));
+        res.json({ quantity: Number(qty) });
+    } catch (e) {
+        console.error("GET /api/inventory error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+app.get("/api/audit/:store_address", async (req, res) => {
+    try {
+        const storeAddress = req.params.store_address;
+        
+        const supplyFilter = tokenContract.filters.SupplyRecorded(null, storeAddress);
+        const supplyLogs = await tokenContract.queryFilter(supplyFilter, 0, "latest");
+        let totalSupplied = 0;
+        supplyLogs.forEach(log => { totalSupplied += Number(log.args[3]); });
+
+        const saleFilter = tokenContract.filters.SaleRecorded(null, storeAddress);
+        const saleLogs = await tokenContract.queryFilter(saleFilter, 0, "latest");
+        let totalSold = 0;
+        saleLogs.forEach(log => { totalSold += Number(log.args[3]); }); // quantity is args[3]
+
+        const inv1 = await tokenContract.inventory(storeAddress, 1);
+        const inv2 = await tokenContract.inventory(storeAddress, 2);
+        const currentInventory = Number(inv1) + Number(inv2);
+
+        res.json({ 
+            store: storeAddress,
+            totalSupplied,
+            totalSold,
+            currentInventory,
+            mismatch: totalSupplied - totalSold - currentInventory
+        });
+    } catch (e) {
+        console.error("GET /api/audit error:", e.reason || e.message);
+        res.status(500).json({ error: e.reason || e.message });
+    }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`PrescChain Ledger API ready on Port ${PORT}`);
+});

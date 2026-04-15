@@ -1,0 +1,15 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model PrescriptionMeta {
+  prescriptionId String   @id @map("prescription_id") // Corresponds to bytes32 hash
+  patientName    String   // AES-256 encrypted
+  pdfPath        String   // Path to the prescription scan
+  createdAt      DateTime @default(now())
+}

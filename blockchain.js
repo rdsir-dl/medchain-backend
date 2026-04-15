@@ -11,7 +11,7 @@ function loadABI(contractName) {
     if(fs.existsSync(artifactPath)) {
         return JSON.parse(fs.readFileSync(artifactPath, "utf-8")).abi;
     } else {
-        console.warn(`\u26a0\ufe0f ${contractName} artifacts not found. Please compile hardhat first!`);
+        console.warn(`⚠️ ${contractName} artifacts not found. Please compile hardhat first!`);
         return [];
     }
 }
@@ -23,7 +23,7 @@ function getDeployedAddress(contractName) {
             const data = JSON.parse(fs.readFileSync(deploymentPath, "utf-8"));
             return data.contracts[contractName] || "0x0000000000000000000000000000000000000000";
         } catch (e) {
-            console.error("\u274c Error reading deployment.json:", e);
+            console.error("❌ Error reading deployment.json:", e);
         }
     }
     return "0x0000000000000000000000000000000000000000";
