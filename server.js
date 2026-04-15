@@ -117,5 +117,7 @@ app.get("/api/accounts/available", async (req, res) => {
     res.json(allAccounts.map(a => a.address));
 });
 
+app.get("/healthz", (req, res) => res.status(200).send("OK"));
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Hub running on port ${PORT}`));
